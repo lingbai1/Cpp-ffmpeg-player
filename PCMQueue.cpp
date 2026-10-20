@@ -1,23 +1,23 @@
 #include "PCMQueue.h"
 #include <chrono>
 
-void PCMQueue::push(std::vector<uint8_t>&& data) {
+void PCMQueue::push(std::vector<uint8_t>&& data, double pts_seconds, bool has_pts) {
     std::lock_guard<std::mutex> lk(mtx);
     if (abort_request) return;
-    q.push_back(std::move(data));
+    q.push_back(PCMItem{std::move(data), pts_seconds, has_pts});
     cond.notify_one();
 }
 
-std::vector<uint8_t> PCMQueue::pop_for(int ms)
+PCMItem PCMQueue::pop_for(int ms)
 {
     std::unique_lock<std::mutex> lk(mtx);
     if (!cond.wait_for(lk, std::chrono::milliseconds(ms), [&]{ return abort_request || !q.empty(); })) {
-        return {};
+        return PCMItem{};
     }
-    if (abort_request && q.empty()) return {};
-    std::vector<uint8_t> v = std::move(q.front());
+    if (abort_request && q.empty()) return PCMItem{};
+    PCMItem item = std::move(q.front());
     q.pop_front();
-    return v;
+    return item;
 }
 
 void PCMQueue::abort()

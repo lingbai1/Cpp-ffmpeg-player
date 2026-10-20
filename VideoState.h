@@ -10,6 +10,7 @@ extern "C" {
 }
 #include<memory>
 #include<mutex>
+#include<atomic>
 #include"PacketQueue.h"
 #include"FrameQueue.h"
 #include"PCMQueue.h"
@@ -47,6 +48,10 @@ class VideoState {
     SwsContext* sws_ctx;        // 色彩转换上下文
     SwrContext* swr_ctx;        // 重采样上下文
     SDL_AudioDeviceID audio_dev;
+    bool audio_enabled;
+    int volume;
+
+    AVFrame* yuv_frame;         // 复用的 YUV420P 转换帧，避免每帧分配
 
     SDL_Thread* demuxThread;
     SDL_Thread* videoThread;
@@ -59,6 +64,15 @@ class VideoState {
 
     bool pause;
     bool quit;
+    // 中止请求：置位后 FFmpeg 中断回调会让阻塞的网络 IO / 打开流程尽快返回
+    std::atomic<bool> abort_request;
+    // 播放到流末尾（Demux 线程读取结束时置位，用于自动连播）
+    std::atomic<bool> eof;
+    // 网络异常状态：仅网络源使用，供 UI 展示重连和最终失败状态
+    std::atomic<bool> is_network_source;
+    std::atomic<bool> network_reconnecting;
+    std::atomic<bool> network_failed;
+    std::atomic<int> network_error_code;
 
     VideoState();
     ~VideoState();

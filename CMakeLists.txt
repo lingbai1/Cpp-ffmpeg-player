@@ -4,9 +4,9 @@ project(Player CXX)
 set(CMAKE_CXX_STANDARD 11)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+set(CMAKE_AUTOMOC ON)       # Qt 的 MOC 自动化
 
 find_package(PkgConfig REQUIRED)
-
 
 pkg_check_modules(AV REQUIRED
     libavformat
@@ -15,14 +15,27 @@ pkg_check_modules(AV REQUIRED
     libswresample
     libavutil)
 
-
 pkg_check_modules(SDL2 REQUIRED sdl2)
 
-include_directories(${AV_INCLUDE_DIRS} ${SDL2_INCLUDE_DIRS})
+# Qt5
+find_package(Qt5 REQUIRED COMPONENTS Widgets)
+
+include_directories(
+    ${AV_INCLUDE_DIRS}
+    ${SDL2_INCLUDE_DIRS}
+    ${Qt5Widgets_INCLUDE_DIRS}
+)
+
 link_directories(${AV_LIBRARY_DIRS} ${SDL2_LIBRARY_DIRS})
+
 add_definitions(${AV_CFLAGS_OTHER} ${SDL2_CFLAGS_OTHER})
 
 add_executable(player
+    main.cpp
+    MainWindow.h
+    MainWindow.cpp
+    SdlVideoWidget.h
+    SdlVideoWidget.cpp
     Player.cpp
     VideoState.cpp
     PacketQueue.cpp
@@ -33,8 +46,13 @@ add_executable(player
     Decoder_audio.cpp
 )
 
-target_link_libraries(player ${AV_LIBRARIES} ${SDL2_LIBRARIES} pthread)
+target_link_libraries(player
+    ${AV_LIBRARIES}
+    ${SDL2_LIBRARIES}
+    Qt5::Widgets
+    X11
+    pthread
+)
 
 set_target_properties(player PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
-
 install(TARGETS player RUNTIME DESTINATION bin)

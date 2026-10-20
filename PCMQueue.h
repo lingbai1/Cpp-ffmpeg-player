@@ -5,15 +5,21 @@
 #include <mutex>
 #include <condition_variable>
 
+struct PCMItem {
+    std::vector<uint8_t> data;
+    double pts_seconds;
+    bool has_pts;
+};
+
 class PCMQueue {
 public:
     PCMQueue() : abort_request(false)
      {}
     ~PCMQueue() { flush(); }
 
-    void push(std::vector<uint8_t>&& data);
+    void push(std::vector<uint8_t>&& data, double pts_seconds, bool has_pts);
 
-    std::vector<uint8_t> pop_for(int ms);
+    PCMItem pop_for(int ms);
 
     void abort();
 
@@ -22,7 +28,7 @@ public:
     size_t size();
 
 private:
-    std::deque<std::vector<uint8_t>> q;
+    std::deque<PCMItem> q;
     std::mutex mtx;
     std::condition_variable cond;
     bool abort_request;

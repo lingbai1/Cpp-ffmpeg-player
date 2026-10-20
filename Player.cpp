@@ -8,8 +8,9 @@ extern "C"{
     #include<libswscale/swscale.h>
     #include<libswresample/swresample.h>
     #include<libavutil/imgutils.h>
+    #include<libavutil/avstring.h>
+    #include<libavutil/opt.h>
 }
-#include<libavutil/pixdesc.h>
 
 #include<iostream>
 #include<thread>
@@ -22,6 +23,7 @@ extern "C"{
 #include<memory>
 #include<cstring>
 #include<cstdio>
+#include<cmath>
 #include"VideoState.h"
 #include"PacketQueue.h"
 #include"FrameQueue.h"
@@ -31,54 +33,28 @@ extern "C"{
 #include"Decoder_audio.h"
 #include"AudioBuffer.h"
 #include"FrameItem.h"
+#include"Player.h"
 
-static enum AVPixelFormat choose_software_pix_fmt(AVCodecContext* ctx, const enum AVPixelFormat* pix_fmts) 
-{
-    if (!pix_fmts)
-    return AV_PIX_FMT_NONE;
-    const enum AVPixelFormat* p = pix_fmts;
-    while (*p != AV_PIX_FMT_NONE) 
-    {
-        const AVPixFmtDescriptor* desc = av_pix_fmt_desc_get(*p);
-        if (desc) {
-            if (!(desc->flags & AV_PIX_FMT_FLAG_HWACCEL)) 
-            {
-                return *p;
-            }
-        } else {
-            return *p;
-        }
-        ++p;
+// 全局初始化标志（确保只初始化一次）
+static bool g_sdl_initialized = false;
+static bool g_network_initialized = false;
+
+bool sdl_global_init() {
+    // 网络协议注册（http/https/rtsp/rtmp/udp 等），必须在任何网络打开之前调用
+    if (!g_network_initialized) {
+        avformat_network_init();
+        g_network_initialized = true;
     }
-    return pix_fmts[0];
+    if (g_sdl_initialized) return true;
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_TIMER) != 0) {
+        av_log(NULL, AV_LOG_ERROR, "Could not initialize SDL: %s\n", SDL_GetError());
+        return false;
+    }
+    g_sdl_initialized = true;
+    return true;
 }
 
-
-class SDLGuard {
-public:
-    SDLGuard() : initialized(false) {}
-
-    bool init(Uint32 flags) {
-        if (SDL_Init(flags) != 0) {
-            return false;
-        }
-        initialized = true;
-        return true;
-    }
-
-    ~SDLGuard() {
-        if (initialized) {
-            SDL_Quit();
-        }
-    }
-
-private:
-    bool initialized;
-};
-
-static double g_drag_ratio = -1.0;
-
-static double get_total_seconds(VideoState* is) {
+double get_total_seconds(VideoState* is) {
     if (!is || !is->formatContext) return 0.0;
     if (is->formatContext->duration > 0 && is->formatContext->duration != AV_NOPTS_VALUE) {
         return (double)is->formatContext->duration / (double)AV_TIME_BASE;
@@ -92,27 +68,6 @@ static double get_total_seconds(VideoState* is) {
     return 0.0;
 }
 
-static bool get_seek_ratio_from_mouse(VideoState* is, int x, int y, double& ratio) {
-    if (!is || !is->renderer) return false;
-    int w = 0, h = 0;
-    SDL_GetRendererOutputSize(is->renderer, &w, &h);
-    if (w <= 0 || h <= 0) return false;
-    const int bar_height = 8;
-    if (y < h - bar_height || y > h) return false;
-    ratio = std::min(std::max(x / (double)w, 0.0), 1.0);
-    return true;
-}
-
-static bool is_on_progress_bar(VideoState* is, int y) {
-    if (!is || !is->renderer) return false;
-    int w = 0, h = 0;
-    SDL_GetRendererOutputSize(is->renderer, &w, &h);
-    if (w <= 0 || h <= 0) return false;
-    const int bar_height = 8;
-    return y >= h - bar_height && y <= h;
-}
-
-
 void call_audio_back(void* userdata, Uint8* stream, int len) {
     VideoState* is = static_cast<VideoState*>(userdata);
     if (!is) 
@@ -125,14 +80,23 @@ void call_audio_back(void* userdata, Uint8* stream, int len) {
     std::lock_guard<std::mutex> lk(is->mutex);
 
     int filled = 0;
+    int bytes_per_second = is->sample_rate * is->channels * av_get_bytes_per_sample(is->sample_fmt);
+
+    auto advance_audio_clock = [&](int bytes) {
+        if (bytes_per_second > 0) {
+            is->audioClock += (double)bytes / (double)bytes_per_second;
+        }
+    };
 
     if (is->audio_buffer.buffer && is->audio_buffer.size > 0) {
         int avail = is->audio_buffer.size - is->audio_buffer.read_offset;
         if (avail > 0) {
             int to_copy = std::min(len, avail);
-            memcpy(stream, is->audio_buffer.buffer + is->audio_buffer.read_offset, to_copy);
+            SDL_MixAudioFormat(stream, is->audio_buffer.buffer + is->audio_buffer.read_offset,
+                               AUDIO_S16SYS, to_copy, is->volume);
             is->audio_buffer.read_offset += to_copy;
             filled += to_copy;
+            advance_audio_clock(to_copy);
             if (is->audio_buffer.read_offset >= is->audio_buffer.size) {
                 av_free(is->audio_buffer.buffer);
                 is->audio_buffer.buffer = nullptr;
@@ -143,35 +107,37 @@ void call_audio_back(void* userdata, Uint8* stream, int len) {
     }
 
     while (filled < len) {
-        std::vector<uint8_t> chunk = is->pcmQueue->pop_for(0);
-        if (chunk.empty()) break;
+        PCMItem item = is->pcmQueue->pop_for(0);
+        if (item.data.empty()) break;
 
-        int data_size = (int)chunk.size();
+        if (item.has_pts && filled == 0) {
+            is->audioClock = item.pts_seconds;
+        }
+
+        int data_size = (int)item.data.size();
         int remain = len - filled;
 
         if (data_size <= remain) {
-            memcpy(stream + filled, chunk.data(), data_size);
+            SDL_MixAudioFormat(stream + filled, item.data.data(),
+                               AUDIO_S16SYS, data_size, is->volume);
             filled += data_size;
+            advance_audio_clock(data_size);
         } else {
-            memcpy(stream + filled, chunk.data(), remain);
+            SDL_MixAudioFormat(stream + filled, item.data.data(),
+                               AUDIO_S16SYS, remain, is->volume);
             int leftover = data_size - remain;
             uint8_t* buf = (uint8_t*)av_malloc(leftover);
             if (buf) {
                 memset(buf, 0, leftover);
-                memcpy(buf, chunk.data() + remain, leftover);
+                memcpy(buf, item.data.data() + remain, leftover);
                 if (is->audio_buffer.buffer) av_free(is->audio_buffer.buffer);
                 is->audio_buffer.buffer = buf;
                 is->audio_buffer.size = leftover;
                 is->audio_buffer.read_offset = 0;
             }
             filled = len;
+            advance_audio_clock(remain);
         }
-    }
-
-  
-    int bytes_per_second = is->sample_rate * is->channels * av_get_bytes_per_sample(is->sample_fmt);
-    if (bytes_per_second > 0) {
-        is->audioClock += (double)filled / (double)bytes_per_second;
     }
 }
 
@@ -190,55 +156,116 @@ void render_frame(VideoState* is) {
 
     AVFrame* frame = item.frame;
 
-    if (frame->width <= 0 || frame->height <= 0 || !frame->data[0]) {
+    if (frame->width <= 0 || frame->height <= 0) {
         av_frame_free(&frame);
         return;
     }
 
     double frame_pts_seconds = 0.0;
+    if (!frame->data[0]) {
+        av_frame_free(&frame);
+        return;
+    }
     if (frame->pts != AV_NOPTS_VALUE) {
         frame_pts_seconds = frame->pts * av_q2d(is->videoStream->time_base);
     } else if (frame->best_effort_timestamp != AV_NOPTS_VALUE) {
         frame_pts_seconds = frame->best_effort_timestamp * av_q2d(is->videoStream->time_base);
     }
 
-    double diff = frame_pts_seconds - is->audioClock;
+    // 有音频时保持音画同步；无音频时直接按视频解码结果渲染，不等待音频时钟。
+    if (is->audio_enabled) {
+        double audio_clock;
+        {
+            std::lock_guard<std::mutex> lk(is->mutex);
+            audio_clock = is->audioClock;
+        }
 
-    if (diff < DROP_THRESHOLD) {
-        // std::cout << "Dropping frame, diff: " << diff << std::endl;
+        int dropped_frames = 0;
+        double diff = frame_pts_seconds - audio_clock;
+        while (diff < DROP_THRESHOLD && dropped_frames < 8) {
+            av_frame_free(&frame);
+            FrameItem next_item = is->video_frameQueue->pop_for(0);
+            if (!next_item.frame) return;
+            frame = next_item.frame;
+            if (!frame->data[0]) {
+                av_frame_free(&frame);
+                return;
+            }
+            if (frame->pts != AV_NOPTS_VALUE) {
+                frame_pts_seconds = frame->pts * av_q2d(is->videoStream->time_base);
+            } else if (frame->best_effort_timestamp != AV_NOPTS_VALUE) {
+                frame_pts_seconds = frame->best_effort_timestamp * av_q2d(is->videoStream->time_base);
+            }
+            diff = frame_pts_seconds - audio_clock;
+            ++dropped_frames;
+        }
+
+        if (diff < DROP_THRESHOLD) {
+            av_frame_free(&frame);
+            return;
+        }
+        if (diff > SYNC_THRESHOLD) {
+            SDL_Delay((Uint32)(std::min(diff, 0.1) * 1000));
+        }
+    }
+
+    AVFrame* src_frame = frame;
+
+    // ---- Step 3: 更新 sws_ctx（源格式 → YUV420P） ----
+    AVPixelFormat src_fmt = (AVPixelFormat)src_frame->format;
+    bool video_size_changed = is->last_width != src_frame->width ||
+                              is->last_height != src_frame->height;
+    if (!is->sws_ctx || video_size_changed || is->last_pix_fmt != src_fmt) {
+        if (is->sws_ctx) sws_freeContext(is->sws_ctx);
+        is->sws_ctx = sws_getContext(src_frame->width, src_frame->height, src_fmt,
+                                     src_frame->width, src_frame->height, AV_PIX_FMT_YUV420P,
+                                     SWS_BILINEAR, nullptr, nullptr, nullptr);
+        is->last_width  = src_frame->width;
+        is->last_height = src_frame->height;
+        is->last_pix_fmt = src_fmt;
+
+        // 重新分配 YUV420P 目标帧
+        if (is->yuv_frame) av_frame_free(&is->yuv_frame);
+        is->yuv_frame = av_frame_alloc();
+        if (is->yuv_frame) {
+            is->yuv_frame->format = AV_PIX_FMT_YUV420P;
+            is->yuv_frame->width  = src_frame->width;
+            is->yuv_frame->height = src_frame->height;
+            int buf_ret = av_frame_get_buffer(is->yuv_frame, 0);
+            if (buf_ret < 0) {
+                av_frame_free(&is->yuv_frame);
+                is->yuv_frame = nullptr;
+            }
+        }
+    }
+
+    // ---- Step 4: sws_scale 将源帧转为 YUV420P ----
+    if (!is->sws_ctx || !is->yuv_frame || !is->yuv_frame->data[0]) {
         av_frame_free(&frame);
         return;
     }
+    sws_scale(is->sws_ctx,
+              src_frame->data, src_frame->linesize,
+              0, src_frame->height,
+              is->yuv_frame->data, is->yuv_frame->linesize);
 
-    if (diff > SYNC_THRESHOLD) {
-        double delay = std::min(diff, 0.1);
-        std::cout << "Delaying for " << delay << "s, diff: " << diff << std::endl;
-        SDL_Delay((Uint32)(delay * 1000));
-    }
-
-    if (!is->sws_ctx||is->last_width != frame->width || is->last_height != frame->height || is->last_pix_fmt != (AVPixelFormat)frame->format) {
-        is->sws_ctx = sws_getContext(frame->width, frame->height, (AVPixelFormat)frame->format,
-                                     frame->width, frame->height, AV_PIX_FMT_YUV420P,
-                                     SWS_BILINEAR, nullptr, nullptr, nullptr);
-        is->last_width = frame->width;
-        is->last_height = frame->height;
-        is->last_pix_fmt = (AVPixelFormat)frame->format;
-    }
-    
-    
-    if (!is->texture||is->last_width != frame->width || is->last_height != frame->height) {
-        if(is->texture) 
-        {
+    // ---- Step 5: 更新 SDL 纹理并渲染 ----
+    if (!is->texture || video_size_changed) {
+        if (is->texture) {
             SDL_DestroyTexture(is->texture);
             is->texture = nullptr;
         }
-        is->texture = SDL_CreateTexture(is->renderer, SDL_PIXELFORMAT_IYUV, SDL_TEXTUREACCESS_STREAMING, frame->width, frame->height);                                                                                                                          
+        is->texture = SDL_CreateTexture(is->renderer, SDL_PIXELFORMAT_IYUV,
+                                        SDL_TEXTUREACCESS_STREAMING,
+                                        src_frame->width, src_frame->height);
     }
 
-    SDL_UpdateYUVTexture(is->texture, nullptr,
-                         frame->data[0], frame->linesize[0],
-                         frame->data[1], frame->linesize[1],
-                         frame->data[2], frame->linesize[2]);
+    if (is->texture) {
+        SDL_UpdateYUVTexture(is->texture, nullptr,
+                             is->yuv_frame->data[0], is->yuv_frame->linesize[0],
+                             is->yuv_frame->data[1], is->yuv_frame->linesize[1],
+                             is->yuv_frame->data[2], is->yuv_frame->linesize[2]);
+    }
 
     SDL_SetRenderDrawColor(is->renderer, 0, 0, 0, 255);
     SDL_RenderClear(is->renderer);
@@ -247,16 +274,22 @@ void render_frame(VideoState* is) {
     SDL_GetRendererOutputSize(is->renderer, &w, &h);
     if (w > 0 && h > 0 && is->last_width > 0 && is->last_height > 0) {
         SDL_Rect rect;
+        AVRational sample_aspect_ratio = av_guess_sample_aspect_ratio(
+            is->formatContext, is->videoStream, src_frame);
+        double pixel_aspect = av_q2d(sample_aspect_ratio);
+        if (pixel_aspect <= 0.0 || !std::isfinite(pixel_aspect)) {
+            pixel_aspect = 1.0;
+        }
         double win_ratio = (double)w / h;
-        double vid_ratio = (double)is->last_width / is->last_height;
+        double vid_ratio = ((double)is->last_width / is->last_height) * pixel_aspect;
         if (win_ratio > vid_ratio) {
             rect.h = h;
-            rect.w = h * vid_ratio;
+            rect.w = (int)(h * vid_ratio);
             rect.x = (w - rect.w) / 2;
             rect.y = 0;
         } else {
             rect.w = w;
-            rect.h = w / vid_ratio;
+            rect.h = (int)(w / vid_ratio);
             rect.x = 0;
             rect.y = (h - rect.h) / 2;
         }
@@ -265,27 +298,9 @@ void render_frame(VideoState* is) {
         SDL_RenderCopy(is->renderer, is->texture, nullptr, nullptr);
     }
 
-    
-    double total_seconds = get_total_seconds(is);
-
-    double current_seconds = std::max(0.0, is->audioClock);
-    double ratio = total_seconds > 0.0 ? std::min(current_seconds / total_seconds, 1.0) : 0.0;
-    if (g_drag_ratio >= 0.0) {
-        ratio = g_drag_ratio;
-    }
-
-    if (w > 0 && h > 0) {
-        int bar_height = 8;
-        SDL_Rect bg = {0, h - bar_height, w, bar_height};
-        SDL_Rect fg = {0, h - bar_height, (int)(w * ratio), bar_height};
-
-        SDL_SetRenderDrawColor(is->renderer, 60, 60, 60, 255);
-        SDL_RenderFillRect(is->renderer, &bg);      
-        SDL_SetRenderDrawColor(is->renderer, 0, 160, 255, 255);
-        SDL_RenderFillRect(is->renderer, &fg);
-    }
     SDL_RenderPresent(is->renderer);
 
+    // ---- 清理 ----
     av_frame_free(&frame);
     is->videoClock = frame_pts_seconds;
 }
@@ -294,6 +309,7 @@ void seek(VideoState* is, double pos_seconds) {
     if (!is) return;
 
     bool was_paused = is->pause;
+
     is->pause = true;
 
     int64_t seek_target = (int64_t)(pos_seconds * AV_TIME_BASE);
@@ -335,52 +351,112 @@ void seek(VideoState* is, double pos_seconds) {
     is->pause = was_paused;
 }
 
-int main(int argc, char* argv[])
- {
-    if (argc < 2) {
-        av_log(NULL, AV_LOG_ERROR, "Please provide a source file\n");
-        return -1;
+// 判断是否为网络 URL（本地文件路径不含 scheme）
+static bool is_network_url(const char* url) {
+    if (!url) return false;
+    if (strstr(url, "://")) return true;
+    static const char* schemes[] = {
+        "http:", "https:", "rtsp:", "rtmp:", "udp:", "rtp:", "srt:", "mms:", "mmsh:", "ftp:"
+    };
+    for (const char* s : schemes) {
+        if (av_stristart(url, s, nullptr)) return true;
+    }
+    return false;
+}
+
+// FFmpeg 中断回调：abort_request 置位时让阻塞的网络 IO / 打开流程尽快返回
+static int interrupt_cb(void* opaque) {
+    VideoState* is = static_cast<VideoState*>(opaque);
+    if (!is) return 0;
+    return is->abort_request ? 1 : 0;
+}
+
+bool player_open(VideoState* is, const char* url) {
+    if (!is || !url) return false;
+    if (!is->window || !is->renderer) {
+        av_log(NULL, AV_LOG_ERROR, "player_open: window/renderer must be set before calling\n");
+        return false;
     }
 
-    const char* src = argv[1];
-    if (!src) {
-        av_log(NULL, AV_LOG_ERROR, "Please provide a source file\n");
-        return -1;
-    }
-    SDLGuard sdl_guard;
-    if (!sdl_guard.init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_TIMER)) {
-        av_log(NULL, AV_LOG_ERROR, "Could not initialize SDL: %s\n", SDL_GetError());
-        return -1;
+    is->abort_request = false;
+    is->eof = false;
+    is->audio_enabled = false;
+
+    bool is_net = is_network_url(url);
+    is->is_network_source = is_net;
+    is->network_reconnecting = false;
+    is->network_failed = false;
+    is->network_error_code = 0;
+
+    // ---- 打开输入（支持本地文件与网络流） ----
+    // 先分配上下文，以便挂上中断回调（网络异常时保证打开流程可被打断）
+    AVFormatContext* ctx = avformat_alloc_context();
+    if (!ctx) return false;
+    ctx->interrupt_callback.callback = interrupt_cb;
+    ctx->interrupt_callback.opaque = is;
+    is->formatContext = ctx;
+
+    AVDictionary* opts = nullptr;
+    if (is_net) {
+        // 读写超时（µs）：避免网络不通时打开流程无限阻塞
+        av_dict_set_int(&opts, "rw_timeout", 10 * AV_TIME_BASE, 0);
+        av_dict_set_int(&opts, "timeout",    10 * AV_TIME_BASE, 0);
+        av_dict_set_int(&opts, "stimeout",   10 * AV_TIME_BASE, 0);   // RTSP 专用
+        // 断线自动重连
+        av_dict_set(&opts, "reconnect", "1", 0);
+        av_dict_set(&opts, "reconnect_streamed", "1", 0);
+        av_dict_set(&opts, "reconnect_delay_max", "5", 0);
+        // 伪装 User-Agent，避免部分服务器拒绝 FFmpeg 默认 UA
+        av_dict_set(&opts, "user_agent", "Player/2.0 (FFmpeg)", 0);
+
+        // RTSP 默认走 TCP 传输，穿透 NAT / 弱网环境更稳定
+        if (av_stristart(url, "rtsp:", nullptr)) {
+            av_dict_set(&opts, "rtsp_transport", "tcp", 0);
+        }
+
+        // 限制探测数据量，加快网络流打开速度
+        av_opt_set_int(ctx, "probesize", 5 * 1024 * 1024, 0);
+        av_opt_set_int(ctx, "analyzeduration", 5 * AV_TIME_BASE, 0);
+
+        // 直播类协议关闭缓冲，降低延迟
+        static const char* live_protos[] = { "udp:", "rtp:", "rtsp:", "rtmp:", "srt:" };
+        for (const char* p : live_protos) {
+            if (av_stristart(url, p, nullptr)) {
+                ctx->flags |= AVFMT_FLAG_NOBUFFER;
+                break;
+            }
+        }
     }
 
-    std::unique_ptr<VideoState> is(new VideoState());
-
-    is->window = SDL_CreateWindow("Player", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, 640, 480, SDL_WINDOW_SHOWN|SDL_WINDOW_RESIZABLE);
-    if (!is->window) {
-        av_log(NULL, AV_LOG_ERROR, "Could not create window: %s\n", SDL_GetError());
-        return -1;
+    int ret = avformat_open_input(&is->formatContext, url, nullptr, &opts);
+    av_dict_free(&opts);
+    if (ret < 0 || !is->formatContext) {
+        char errbuf[128];
+        av_strerror(ret, errbuf, sizeof(errbuf));
+        av_log(NULL, AV_LOG_ERROR, "Could not open source %s: %s\n", url, errbuf);
+        is->formatContext = nullptr;
+        return false;
     }
 
-    is->renderer = SDL_CreateRenderer(is->window, -1, 0);
-    if (!is->renderer) {
-        av_log(NULL, AV_LOG_ERROR, "Could not create renderer: %s\n", SDL_GetError());
-        return -1;
+    // 打开期间被中止（切歌/关闭）
+    if (is->abort_request) {
+        avformat_close_input(&is->formatContext);
+        return false;
     }
 
-    int ret = avformat_open_input(&is->formatContext, src, nullptr, nullptr);
+    // 获取流信息
+    ret = avformat_find_stream_info(is->formatContext, nullptr);
     if (ret < 0) {
         char errbuf[128];
         av_strerror(ret, errbuf, sizeof(errbuf));
-        av_log(NULL, AV_LOG_ERROR, "Could not open source file %s: %s\n", src, errbuf);
-        return -1;
+        av_log(NULL, AV_LOG_WARNING, "Could not find stream info: %s\n", errbuf);
     }
 
     int v_stream_index = av_find_best_stream(is->formatContext, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
     if (v_stream_index < 0) {
-        char errbuf[128];
-        av_strerror(v_stream_index, errbuf, sizeof(errbuf));
-        av_log(NULL, AV_LOG_ERROR, "Could not find video stream: %s\n", errbuf);
-        return -1;
+        av_log(NULL, AV_LOG_ERROR, "Could not find video stream\n");
+        avformat_close_input(&is->formatContext);
+        return false;
     }
     is->VideoStreamIndex = v_stream_index;
 
@@ -392,10 +468,11 @@ int main(int argc, char* argv[])
     if (!vcodec || !vcodecContext) 
     {
         av_log(NULL, AV_LOG_ERROR, "Could not allocate video codec\n");
-        return -1;
+        avformat_close_input(&is->formatContext);
+        return false;
     }
     avcodec_parameters_to_context(vcodecContext, is->formatContext->streams[v_stream_index]->codecpar);
-    vcodecContext->get_format = choose_software_pix_fmt;
+
     ret = avcodec_open2(vcodecContext, vcodec, nullptr);
     if (ret < 0) 
     {
@@ -403,7 +480,8 @@ int main(int argc, char* argv[])
         av_strerror(ret, errbuf, sizeof(errbuf));
         av_log(NULL, AV_LOG_ERROR, "Could not open video codec: %s\n", errbuf);
         avcodec_free_context(&vcodecContext);
-        return -1;
+        avformat_close_input(&is->formatContext);
+        return false;
     }
     is->videoCodecContext = vcodecContext;
     is->videoStream = is->formatContext->streams[v_stream_index];
@@ -442,7 +520,7 @@ int main(int argc, char* argv[])
                 wanted_spec.silence = 0;
                 wanted_spec.samples = FFMAX(512, 2048);
                 wanted_spec.callback = call_audio_back;
-                wanted_spec.userdata = is.get();
+                wanted_spec.userdata = is;
 
                 is->audio_dev = SDL_OpenAudioDevice(nullptr, 0, &wanted_spec, &spec, SDL_AUDIO_ALLOW_ANY_CHANGE);
                 if (is->audio_dev == 0) {
@@ -451,6 +529,7 @@ int main(int argc, char* argv[])
                     is->sample_rate = spec.freq;
                     is->channels = spec.channels;
                     is->sample_fmt = AV_SAMPLE_FMT_S16;
+                    is->audio_enabled = true;
                     SDL_PauseAudioDevice(is->audio_dev, 0); // start playing audio
                 }
             }
@@ -462,95 +541,121 @@ int main(int argc, char* argv[])
     is->video_frameQueue.reset(new FrameQueue(32));
     is->pcmQueue.reset(new PCMQueue());
 
-
-    is->demuxThread = SDL_CreateThread(Demux_Thread, "demux", is.get());
-    is->videoThread = SDL_CreateThread(Decoder_video_thread, "video", is.get());
-    is->audioThread = SDL_CreateThread(Decoder_audio_thread, "audio", is.get());
-
-    SDL_Event e;
-    bool dragging = false;          // 是否正在拖动进度条
-    double drag_ratio = 0.0;        // 当前拖动位置对应的播放比例
-    while (!is->quit) {
-        while (SDL_PollEvent(&e)) {
-            if (e.type == SDL_QUIT) 
-            {
-                is->quit = true;
-            } 
-            else if (e.type == SDL_MOUSEBUTTONDOWN && e.button.button == SDL_BUTTON_LEFT)
-            {
-                double ratio = 0.0;
-                if (get_seek_ratio_from_mouse(is.get(), e.button.x, e.button.y, ratio)) {
-                    dragging = true;
-                    drag_ratio = ratio;
-                    g_drag_ratio = ratio;
-                }
-            }
-            else if (e.type == SDL_MOUSEMOTION && dragging)
-            {
-                double ratio = 0.0;
-                if (get_seek_ratio_from_mouse(is.get(), e.motion.x, e.motion.y, ratio)) {
-                    drag_ratio = ratio;
-                    g_drag_ratio = ratio;
-                }
-            }
-            else if (e.type == SDL_MOUSEBUTTONUP && e.button.button == SDL_BUTTON_LEFT)
-            {
-                if (dragging) {
-                    dragging = false;
-                    g_drag_ratio = -1.0;
-                    double total_seconds = get_total_seconds(is.get());
-                    if (total_seconds > 0.0) {
-                        seek(is.get(), drag_ratio * total_seconds);
-                    }
-                }
-            }
-            else if (e.type == SDL_KEYDOWN)
-             {
-                switch (e.key.keysym.sym) 
-                {
-                    case SDLK_SPACE:
-                        is->pause = !is->pause;
-                        if (is->audio_dev != 0)
-                        {
-                            SDL_PauseAudioDevice(is->audio_dev, is->pause ? 1 : 0);
-                        }
-                        break;
-                    case SDLK_RIGHT:
-                        seek(is.get(), is->audioClock + 10);
-                        break;
-                    case SDLK_LEFT:
-                        seek(is.get(), std::max(0.0, is->audioClock - 10));
-                        break;
-                }
-            }
-        }
-
-        if (!is->pause) {
-            render_frame(is.get());
-        }
-
-        SDL_Delay(10);
+    // 启动工作线程
+    is->quit = false;
+    is->demuxThread = SDL_CreateThread(Demux_Thread, "demux", is);
+    is->videoThread = SDL_CreateThread(Decoder_video_thread, "video", is);
+    if (is->audio_enabled) {
+        is->audioThread = SDL_CreateThread(Decoder_audio_thread, "audio", is);
     }
 
+    return true;
+}
+
+void player_close(VideoState* is) {
+    if (!is) return;
+
+    // 0. 置中止标志：让 FFmpeg 中断回调立刻生效，阻塞在 av_read_frame 的线程会尽快返回
+    is->abort_request = true;
+
+    // 1. 通知所有线程退出
     is->quit = true;
-    is->packetQueue->abort();
-    is->audioPacketQueue->abort();
-    is->video_frameQueue->abort();
-    is->pcmQueue->abort();
+    if (is->packetQueue)      is->packetQueue->abort();
+    if (is->audioPacketQueue) is->audioPacketQueue->abort();
+    if (is->video_frameQueue) is->video_frameQueue->abort();
+    if (is->pcmQueue)         is->pcmQueue->abort();
 
+    // 2. 等待线程结束
     int thread_ret = 0;
-    if (is->demuxThread) 
-    {
+    if (is->demuxThread) {
         SDL_WaitThread(is->demuxThread, &thread_ret);
+        is->demuxThread = nullptr;
     }
-    if (is->videoThread) 
-    {
+    if (is->videoThread) {
         SDL_WaitThread(is->videoThread, &thread_ret);
+        is->videoThread = nullptr;
     }
-    if (is->audioThread) 
-    {
+    if (is->audioThread) {
         SDL_WaitThread(is->audioThread, &thread_ret);
+        is->audioThread = nullptr;
     }
 
-    return 0;
+    // 3. 关闭音频设备
+    if (is->audio_dev != 0) {
+        SDL_CloseAudioDevice(is->audio_dev);
+        is->audio_dev = 0;
+    }
+
+    // 4. 释放编解码器
+    if (is->videoCodecContext) {
+        avcodec_free_context(&is->videoCodecContext);
+        is->videoCodecContext = nullptr;
+    }
+    if (is->audioCodecContext) {
+        avcodec_free_context(&is->audioCodecContext);
+        is->audioCodecContext = nullptr;
+    }
+
+    // 5. 关闭格式上下文
+    if (is->formatContext) {
+        avformat_close_input(&is->formatContext);
+        is->formatContext = nullptr;
+    }
+
+    // 6. 销毁 SDL 渲染资源（Qt 集成模式下由 player_close 统一管理）
+    if (is->texture) {
+        SDL_DestroyTexture(is->texture);
+        is->texture = nullptr;
+    }
+    if (is->renderer) {
+        SDL_DestroyRenderer(is->renderer);
+        is->renderer = nullptr;
+    }
+    if (is->window) {
+        SDL_DestroyWindow(is->window);
+        is->window = nullptr;
+    }
+
+    // 7. 释放转换上下文
+    if (is->sws_ctx) {
+        sws_freeContext(is->sws_ctx);
+        is->sws_ctx = nullptr;
+    }
+    if (is->swr_ctx) {
+        swr_free(&is->swr_ctx);
+        is->swr_ctx = nullptr;
+    }
+
+    // 8. 清理音频缓冲
+    if (is->audio_buffer.buffer) {
+        av_free(is->audio_buffer.buffer);
+        is->audio_buffer.buffer = nullptr;
+    }
+    is->audio_buffer.size = 0;
+    is->audio_buffer.read_offset = 0;
+
+    // 9. 释放 YUV 转换帧
+    if (is->yuv_frame) {
+        av_frame_free(&is->yuv_frame);
+        is->yuv_frame = nullptr;
+    }
+
+    // 重置状态字段
+    is->last_width = 0;
+    is->last_height = 0;
+    is->last_pix_fmt = AV_PIX_FMT_NONE;
+    is->audioClock = 0.0;
+    is->videoClock = 0.0;
+    is->audio_enabled = false;
+    is->VideoStreamIndex = -1;
+    is->AudioStreamIndex = -1;
+    is->videoStream = nullptr;
+    is->audioStream = nullptr;
+}
+
+void set_volume(VideoState* is, int volume_percent) {
+    if (!is) return;
+    volume_percent = std::max(0, std::min(volume_percent, 100));
+    std::lock_guard<std::mutex> lk(is->mutex);
+    is->volume = volume_percent * SDL_MIX_MAXVOLUME / 100;
 }

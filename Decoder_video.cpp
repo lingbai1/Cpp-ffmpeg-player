@@ -4,6 +4,8 @@
 int Decoder_video_thread(void* arg) {
     VideoState* is = static_cast<VideoState*>(arg);
     AVPacket* packet = nullptr;
+    AVFrame* frame = av_frame_alloc();
+    if (!frame) return -1;
 
     while (!is->quit) {
         if (is->pause) {
@@ -23,10 +25,9 @@ int Decoder_video_thread(void* arg) {
         av_packet_free(&packet);
         if (ret < 0) continue;
 
-        AVFrame* frame = av_frame_alloc();
         while (ret >= 0) {
             ret = avcodec_receive_frame(is->videoCodecContext, frame);
-            if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) break;
+            if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) break;   
             if (ret < 0) break;
             if (frame->pts == AV_NOPTS_VALUE && frame->best_effort_timestamp != AV_NOPTS_VALUE) {
                 frame->pts = frame->best_effort_timestamp;
@@ -38,8 +39,8 @@ int Decoder_video_thread(void* arg) {
             }
             av_frame_unref(frame);
         }
-        av_frame_free(&frame);
     }
 
+    av_frame_free(&frame);
     return 0;
 }

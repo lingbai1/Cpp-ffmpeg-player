@@ -37,10 +37,11 @@
 
     FrameItem FrameQueue::pop_for(int ms) {
         std::unique_lock<std::mutex> lk(mutex);
+        //判断条件：如果abort_request为true或者nb_frames大于0，则继续执行，否则等待，等待时间为ms毫秒，等待期间如果abort_request变为true或者nb_frames变为0，则继续执行，否则返回
         if (!cond.wait_for(lk, std::chrono::milliseconds(ms), [&]{ return abort_request || nb_frames > 0; })) {
-            return FrameItem{nullptr, 0, 0, 0.0, 0};
+            return FrameItem{};
         }
-        if (abort_request && nb_frames == 0) return FrameItem{nullptr, 0, 0, 0.0, 0};
+        if (abort_request && nb_frames == 0) return FrameItem{};
         FrameItem item = std::move(q.front());
         q.pop_front();
         nb_frames--;
