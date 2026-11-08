@@ -3,11 +3,20 @@
 
     bool PacketQueue::push_blocking(AVPacket* src_pkt)
      {
+        return push_blocking(src_pkt, nullptr, 0);
+     }
+
+    bool PacketQueue::push_blocking(AVPacket* src_pkt,
+                                    const std::atomic<uint64_t>* serial,
+                                    uint64_t expected_serial)
+     {
         std::unique_lock<std::mutex> lk(mtx);
-        while (!abort_request && (nb_packets >= max_packets || size_bytes >= (int)max_bytes)) {
+        while (!abort_request &&
+               (!serial || serial->load() == expected_serial) &&
+               (nb_packets >= max_packets || size_bytes >= (int)max_bytes)) {
             cond.wait_for(lk, std::chrono::milliseconds(50));
         }
-        if (abort_request) return false;
+        if (abort_request || (serial && serial->load() != expected_serial)) return false;
 
         AVPacket* pcopy = av_packet_alloc();
         if (!pcopy) return false;
@@ -57,5 +66,10 @@
         cond.notify_all();
     }
 
-    void PacketQueue::destroy() { flush(); }
+    void PacketQueue::reset_abort() {
+        std::lock_guard<std::mutex> lk(mtx);
+        abort_request = false;
+        cond.notify_all();
+    }
 
+    void PacketQueue::destroy() { flush(); }

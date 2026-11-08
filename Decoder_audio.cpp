@@ -12,6 +12,7 @@ int Decoder_audio_thread(void* arg) {
 			continue;
 		}
 
+		const uint64_t packet_serial = is->seek_serial.load();
 		packet = is->audioPacketQueue->pop_for(100);
 		if (!packet) continue;
 
@@ -20,16 +21,24 @@ int Decoder_audio_thread(void* arg) {
 			continue;
 		}
 
-		int ret = avcodec_send_packet(is->audioCodecContext, packet);
-		av_packet_free(&packet);
-		if (ret < 0) continue;
+		int ret = 0;
+		{
+			std::lock_guard<std::mutex> seek_lk(is->seek_mutex);
+			std::lock_guard<std::mutex> decode_lk(is->decode_mutex);
+			if (packet_serial != is->seek_serial.load() || is->pause) {
+				av_packet_free(&packet);
+				continue;
+			}
+			ret = avcodec_send_packet(is->audioCodecContext, packet);
+			av_packet_free(&packet);
+			if (ret < 0) continue;
 
-		while (ret >= 0) {
-			ret = avcodec_receive_frame(is->audioCodecContext, frame);
-			if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) break;
-			if (ret < 0) break;
+			while (ret >= 0) {
+				ret = avcodec_receive_frame(is->audioCodecContext, frame);
+				if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) break;
+				if (ret < 0) break;
 			
-			int64_t in_ch_layout = frame->channel_layout ? frame->channel_layout : av_get_default_channel_layout(frame->channels);
+				int64_t in_ch_layout = frame->channel_layout ? frame->channel_layout : av_get_default_channel_layout(frame->channels);
 			int64_t out_ch_layout = is->channel_layout;
 			int out_rate = (int)is->sample_rate;
 			AVSampleFormat out_fmt = is->sample_fmt;
@@ -81,12 +90,11 @@ int Decoder_audio_thread(void* arg) {
 
 			av_freep(&converted[0]);
 			av_freep(&converted);
-			av_frame_unref(frame);
+				av_frame_unref(frame);
+			}
 		}
 	}
 
 	av_frame_free(&frame);
 	return 0;
 }
-
-

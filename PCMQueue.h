@@ -23,6 +23,8 @@ public:
 
     void abort();
 
+    void reset_abort();
+
     void flush();
 
     size_t size();

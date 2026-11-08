@@ -2,6 +2,7 @@
 #include<deque>
 #include<mutex>
 #include<condition_variable>
+#include<atomic>
 #include<stdint.h>
 extern "C" {
     #include<libavformat/avformat.h>
@@ -25,6 +26,8 @@ class PacketQueue{
      { destroy(); }
 
     bool push_blocking(AVPacket* src_pkt);
+    bool push_blocking(AVPacket* src_pkt, const std::atomic<uint64_t>* serial,
+                       uint64_t expected_serial);
      
 
     AVPacket* pop_for(int ms) ;
@@ -33,6 +36,8 @@ class PacketQueue{
         
 
     void abort();
+
+    void reset_abort();
 
     void destroy() ;
 

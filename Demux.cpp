@@ -34,13 +34,15 @@ int Demux_Thread(void *arg)
     int network_failures = 0;
 
     while (!is->quit) {
-        if (is->pause) {
-            SDL_Delay(10);
-            continue;
-        }
-        
         int read_ret = 0;
+        uint64_t packet_serial = 0;
         {
+            std::lock_guard<std::mutex> seek_lk(is->seek_mutex);
+            if (is->pause) {
+                SDL_Delay(10);
+                continue;
+            }
+            packet_serial = is->seek_serial.load();
             std::lock_guard<std::mutex> lk(is->format_mutex);
             read_ret = av_read_frame(is->formatContext, packet);
         }
@@ -65,6 +67,14 @@ int Demux_Thread(void *arg)
                 continue;
             }
 
+            if (read_ret == AVERROR_EOF && !is->is_network_source) {
+                // 保留 demux 线程，seek 后仍需要由它从新的文件位置继续读包。
+                is->eof = true;
+                av_packet_unref(packet);
+                SDL_Delay(20);
+                continue;
+            }
+
             is->network_reconnecting = false;
             if (is->is_network_source && read_ret != AVERROR_EOF && !is->quit) {
                 is->network_failed = true;
@@ -76,21 +86,26 @@ int Demux_Thread(void *arg)
             break;
         }
 
+        if (packet->stream_index == is->VideoStreamIndex) {
+            if (!is->packetQueue->push_blocking(
+                    packet, &is->seek_serial, packet_serial)) {
+                av_packet_unref(packet);
+                if (is->quit) break;
+                continue;
+            }
+        } else if (packet->stream_index == is->AudioStreamIndex) {
+            if (!is->audioPacketQueue->push_blocking(
+                    packet, &is->seek_serial, packet_serial)) {
+                av_packet_unref(packet);
+                if (is->quit) break;
+                continue;
+            }
+        }
+
         network_failures = 0;
         is->network_reconnecting = false;
         is->network_error_code = 0;
 
-        if (packet->stream_index == is->VideoStreamIndex) {
-            if (!is->packetQueue->push_blocking(packet)) {
-                av_packet_unref(packet);
-                break;
-            }
-        } else if (packet->stream_index == is->AudioStreamIndex) {
-            if (!is->audioPacketQueue->push_blocking(packet)) {
-                av_packet_unref(packet);
-                break;
-            }
-        }
         av_packet_unref(packet);
     }
 

@@ -27,6 +27,13 @@ void PCMQueue::abort()
     cond.notify_all();
 }
 
+void PCMQueue::reset_abort()
+{
+    std::lock_guard<std::mutex> lk(mtx);
+    abort_request = false;
+    cond.notify_all();
+}
+
 void PCMQueue::flush()
 {
     std::lock_guard<std::mutex> lk(mtx);

@@ -344,6 +344,11 @@ void MainWindow::onOpenFinished(bool ok)
 
 void MainWindow::stopPlayback()
 {
+    // 先置 quit，阻止定时渲染槽继续进入 render_frame。
+    if (m_videoState) {
+        m_videoState->quit = true;
+    }
+
     m_progressTimer->stop();
     m_videoWidget->stopRendering();
 

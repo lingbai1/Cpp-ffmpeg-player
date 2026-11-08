@@ -28,6 +28,8 @@ class FrameQueue
 
     void abort() ;
 
+    void reset_abort();
+
     void destroy();
 
     int size();

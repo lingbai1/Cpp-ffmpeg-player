@@ -69,6 +69,13 @@
         abort_request = true;
         cond.notify_all();
     }
+
+    void FrameQueue::reset_abort()
+    {
+        std::lock_guard<std::mutex> lk(mutex);
+        abort_request = false;
+        cond.notify_all();
+    }
     
     void FrameQueue::destroy() 
     { 

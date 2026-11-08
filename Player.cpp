@@ -145,6 +145,10 @@ void call_audio_back(void* userdata, Uint8* stream, int len) {
 
 
 void render_frame(VideoState* is) {
+    if (!is || is->quit) return;
+    if (!is->video_frameQueue || !is->renderer) return;
+    if (!is->videoStream || !is->formatContext) return;
+
     const double SYNC_THRESHOLD = 0.03;
     const double DROP_THRESHOLD = -0.12;
 
@@ -255,6 +259,10 @@ void render_frame(VideoState* is) {
             SDL_DestroyTexture(is->texture);
             is->texture = nullptr;
         }
+        if (!is->renderer) {
+            av_frame_free(&frame);
+            return;
+        }
         is->texture = SDL_CreateTexture(is->renderer, SDL_PIXELFORMAT_IYUV,
                                         SDL_TEXTUREACCESS_STREAMING,
                                         src_frame->width, src_frame->height);
@@ -267,6 +275,11 @@ void render_frame(VideoState* is) {
                              is->yuv_frame->data[2], is->yuv_frame->linesize[2]);
     }
 
+    if (!is->renderer) {
+        av_frame_free(&frame);
+        return;
+    }
+
     SDL_SetRenderDrawColor(is->renderer, 0, 0, 0, 255);
     SDL_RenderClear(is->renderer);
 
@@ -274,8 +287,17 @@ void render_frame(VideoState* is) {
     SDL_GetRendererOutputSize(is->renderer, &w, &h);
     if (w > 0 && h > 0 && is->last_width > 0 && is->last_height > 0) {
         SDL_Rect rect;
-        AVRational sample_aspect_ratio = av_guess_sample_aspect_ratio(
-            is->formatContext, is->videoStream, src_frame);
+        AVRational sample_aspect_ratio = {1, 1};
+        {
+            std::lock_guard<std::mutex> lk(is->format_mutex);
+            if (is->formatContext && is->videoStream) {
+                sample_aspect_ratio = av_guess_sample_aspect_ratio(
+                    is->formatContext, is->videoStream, src_frame);
+            } else if (src_frame->sample_aspect_ratio.num > 0 &&
+                       src_frame->sample_aspect_ratio.den > 0) {
+                sample_aspect_ratio = src_frame->sample_aspect_ratio;
+            }
+        }
         double pixel_aspect = av_q2d(sample_aspect_ratio);
         if (pixel_aspect <= 0.0 || !std::isfinite(pixel_aspect)) {
             pixel_aspect = 1.0;
@@ -308,16 +330,35 @@ void render_frame(VideoState* is) {
 void seek(VideoState* is, double pos_seconds) {
     if (!is) return;
 
+    pos_seconds = std::max(0.0, pos_seconds);
     bool was_paused = is->pause;
 
+    std::lock_guard<std::mutex> seek_lk(is->seek_mutex);
+    is->seek_serial.fetch_add(1);
     is->pause = true;
 
-    int64_t seek_target = (int64_t)(pos_seconds * AV_TIME_BASE);
+    // 等待当前 demux/decode 操作结束后再 flush，避免旧 GOP 与新位置交错。
+    {
+        std::lock_guard<std::mutex> decode_lk(is->decode_mutex);
+        if (is->videoCodecContext) avcodec_flush_buffers(is->videoCodecContext);
+        if (is->audioCodecContext) avcodec_flush_buffers(is->audioCodecContext);
+    }
 
+    int seek_stream = -1;
+    int64_t seek_target = (int64_t)(pos_seconds * AV_TIME_BASE);
+    if (is->videoStream && is->VideoStreamIndex >= 0) {
+        // H.264 必须从视频关键帧开始，不能让 av_seek_frame 选择音频流的索引点。
+        seek_stream = is->VideoStreamIndex;
+        seek_target = av_rescale_q(
+            (int64_t)(pos_seconds * AV_TIME_BASE),
+            AV_TIME_BASE_Q,
+            is->videoStream->time_base);
+    }
     int seek_ret = 0;
     {
         std::lock_guard<std::mutex> lk(is->format_mutex);
-        seek_ret = av_seek_frame(is->formatContext, -1, seek_target, AVSEEK_FLAG_BACKWARD);
+        seek_ret = av_seek_frame(is->formatContext, seek_stream, seek_target,
+                                 AVSEEK_FLAG_BACKWARD);
     }
 
     if (seek_ret < 0) {
@@ -328,13 +369,14 @@ void seek(VideoState* is, double pos_seconds) {
         return;
     }
 
-    if (is->videoCodecContext) avcodec_flush_buffers(is->videoCodecContext);
-    if (is->audioCodecContext) avcodec_flush_buffers(is->audioCodecContext);
-
     is->packetQueue->flush();
     is->audioPacketQueue->flush();
     is->video_frameQueue->flush();
     is->pcmQueue->flush();
+    is->packetQueue->reset_abort();
+    is->audioPacketQueue->reset_abort();
+    is->video_frameQueue->reset_abort();
+    is->pcmQueue->reset_abort();
 
     {
         std::lock_guard<std::mutex> lk(is->mutex);
@@ -348,6 +390,7 @@ void seek(VideoState* is, double pos_seconds) {
 
     is->audioClock = pos_seconds;
     is->videoClock = pos_seconds;
+    is->eof = false;
     is->pause = was_paused;
 }
 

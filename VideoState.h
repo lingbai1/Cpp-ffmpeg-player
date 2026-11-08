@@ -58,11 +58,16 @@ class VideoState {
     SDL_Thread* audioThread;
 
     std::mutex mutex;
+    // 保护 avcodec_send_packet/receive_frame 与 seek flush 的并发访问
+    std::mutex decode_mutex;
+    // 阻止 seek 与 demux/decoder 同时推进媒体状态
+    std::mutex seek_mutex;
+    std::atomic<uint64_t> seek_serial;
     std::mutex format_mutex;
     std::unique_ptr<PCMQueue> pcmQueue;
     AudioBuffer audio_buffer;
 
-    bool pause;
+    std::atomic<bool> pause;
     bool quit;
     // 中止请求：置位后 FFmpeg 中断回调会让阻塞的网络 IO / 打开流程尽快返回
     std::atomic<bool> abort_request;

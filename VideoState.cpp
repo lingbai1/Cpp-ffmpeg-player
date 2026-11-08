@@ -11,6 +11,7 @@ VideoState::VideoState()
           yuv_frame(nullptr),
           demuxThread(nullptr), videoThread(nullptr), audioThread(nullptr),
           pause(false), quit(false), abort_request(false), eof(false),
+          seek_serial(0),
           is_network_source(false), network_reconnecting(false), network_failed(false),
           network_error_code(0)
     {
